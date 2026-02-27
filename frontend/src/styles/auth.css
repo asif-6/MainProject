@@ -28,6 +28,34 @@
   overflow: hidden;
 }
 
+.auth-notice {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  min-width: 280px;
+  max-width: 420px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  font-size: 0.92rem;
+  font-weight: 600;
+  box-shadow: 0 14px 30px rgba(10, 40, 45, 0.24);
+  border: 1px solid;
+  z-index: 20;
+  animation: authNoticeIn 240ms ease-out;
+}
+
+.auth-notice--success {
+  background: linear-gradient(135deg, #dcfce7 0%, #f0fdf4 100%);
+  color: #166534;
+  border-color: #86efac;
+}
+
+.auth-notice--error {
+  background: linear-gradient(135deg, #fee2e2 0%, #fff1f2 100%);
+  color: #991b1b;
+  border-color: #fca5a5;
+}
+
 .auth-container::before,
 .auth-container::after {
   content: "";
@@ -197,6 +225,17 @@
   from {
     opacity: 0;
     transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes authNoticeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
   }
   to {
     opacity: 1;

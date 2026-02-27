@@ -2,12 +2,12 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     SignupView, LoginView, pharmacy_dashboard, delivery_dashboard,
-    profile_view,
+    profile_view, bulk_add_medicines,
     UserViewSet, PharmacyViewSet, MedicineViewSet, PharmacyMedicineViewSet,
     OrderViewSet, DeliveryViewSet, RestockRequestViewSet, SupportTicketViewSet,
     create_order, process_payment, pharmacy_accept_order, delivery_accept_order,
     mark_delivery_complete, user_orders, pharmacy_orders, delivery_orders, assign_delivery_partner,
-    get_pending_delivery_orders, get_delivery_notifications, get_user_notifications, accept_delivery_order, mark_notification_read,
+    get_pending_delivery_orders, get_delivery_notifications, get_user_notifications, accept_delivery_order, delivery_reject_order, mark_notification_read,
     mark_notifications_read, delete_notification,
     create_razorpay_order, verify_razorpay_payment, manage_cart, cart_item_detail, clear_cart, checkout_cart,
     generate_delivery_otp, verify_delivery_otp, create_cart_razorpay_order, verify_cart_razorpay_payment, request_refund
@@ -29,6 +29,7 @@ urlpatterns = [
     path("pharmacy-dashboard/", pharmacy_dashboard, name="pharmacy_dashboard"),
     path("delivery-dashboard/", delivery_dashboard, name="delivery_dashboard"),
     path("profile/", profile_view, name="profile"),
+    path("pharmacy-medicines/bulk-add/", bulk_add_medicines, name="bulk_add_medicines"),
     path("create-order/", create_order, name="create_order"),
     path("process-payment/<str:order_id>/", process_payment, name="process_payment"),
     path("create-razorpay-order/<str:order_id>/", create_razorpay_order, name="create_razorpay_order"),
@@ -51,6 +52,7 @@ urlpatterns = [
     path("delete-notification/<int:notification_id>/", delete_notification, name="delete_notification"),
     path("delete-notifications/", delete_notification, name="delete_notifications"),
     path("accept-delivery-order/<str:order_id>/", accept_delivery_order, name="accept_delivery_order"),
+    path("delivery-reject-order/<str:order_id>/", delivery_reject_order, name="delivery_reject_order"),
     path("mark-notification-read/<int:notification_id>/", mark_notification_read, name="mark_notification_read"),
     path("cart/", manage_cart, name="manage_cart"),
     path("cart-item/<int:cart_item_id>/", cart_item_detail, name="cart_item_detail"),

@@ -556,12 +556,22 @@ export default function UserDashboard() {
         body: JSON.stringify({ reason: reason.trim() }),
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Refund request failed");
+      const responseText = await response.text();
+      let result = null;
+      try {
+        result = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        result = {};
       }
 
-      const result = await response.json();
+      if (!response.ok) {
+        const serverMessage = result.error || result.message;
+        const fallback = responseText && !responseText.trim().startsWith("<!DOCTYPE")
+          ? responseText
+          : `Refund request failed (HTTP ${response.status})`;
+        throw new Error(serverMessage || fallback);
+      }
+
       const completionDate = new Date(new Date(result.refund_initiated_at).getTime() + 3 * 24 * 60 * 60 * 1000);
       setRefundSuccessModal({
         orderId: orderId,

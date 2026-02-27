@@ -6,6 +6,7 @@ export default function Login() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
 
   const [formData, setFormData] = useState({
     email: "",
@@ -20,10 +21,11 @@ export default function Login() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
+    setSuccess("");
     setLoading(true);
 
     if (!formData.role) {
-      alert("Please select your role!");
+      setError("Please select your role!");
       setLoading(false);
       return;
     }
@@ -47,16 +49,19 @@ export default function Login() {
         localStorage.setItem("authToken", data.token);
         localStorage.setItem("role", data.role);
         if (data.email) localStorage.setItem("email", data.email);
+        setSuccess("Login successful. Redirecting to your dashboard...");
 
-        if (data.role === "admin") {
-          navigate("/admin");
-        } else if (data.role === "pharmacy") {
-          navigate("/pharmacy");
-        } else if (data.role === "delivery") {
-          navigate("/delivery");
-        } else {
-          navigate("/dashboard");
-        }
+        setTimeout(() => {
+          if (data.role === "admin") {
+            navigate("/admin");
+          } else if (data.role === "pharmacy") {
+            navigate("/pharmacy");
+          } else if (data.role === "delivery") {
+            navigate("/delivery");
+          } else {
+            navigate("/dashboard");
+          }
+        }, 700);
       } else {
         setError(data.message || "Login failed. Please try again.");
       }
@@ -70,11 +75,14 @@ export default function Login() {
 
   return (
     <div className="auth-container">
+      {(error || success) && (
+        <div className={`auth-notice ${success ? "auth-notice--success" : "auth-notice--error"}`}>
+          {success || error}
+        </div>
+      )}
       <div className="auth-card">
         <h2 className="auth-title">Login</h2>
         <p className="auth-subtitle">Access your dashboard and manage medicines.</p>
-
-        {error && <p style={{ color: "#ef4444", marginBottom: "15px" }}>{error}</p>}
 
         <form onSubmit={handleSubmit} className="auth-form">
           <label>Email</label>

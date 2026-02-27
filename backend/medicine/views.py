@@ -7,10 +7,12 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.decorators import api_view, permission_classes
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth import get_user_model
-from django.db.models import Sum, Count, Q
+from django.db.models import Sum, Count, Q, Avg
+from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
 from django.conf import settings
+from decimal import Decimal, InvalidOperation
 import razorpay
 from .serializers import (
     SignupSerializer, UserSerializer, PharmacySerializer, MedicineSerializer,
@@ -186,6 +188,105 @@ def profile_view(request):
         "full_name": getattr(user, "full_name", "") if hasattr(user, "full_name") else "",
         "role": getattr(user, "role", ""),
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def bulk_add_medicines(request):
+    """Bulk add/update medicines for the authenticated pharmacy."""
+    pharmacy = getattr(request.user, 'pharmacy', None)
+    if pharmacy is None:
+        return Response(
+            {"error": "Only pharmacy users can bulk add medicines"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    medicines = request.data.get('medicines', [])
+    if not isinstance(medicines, list) or not medicines:
+        return Response(
+            {"error": "'medicines' must be a non-empty list"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    success_count = 0
+    failed_count = 0
+    results = []
+
+    with transaction.atomic():
+        for index, item in enumerate(medicines, start=1):
+            try:
+                raw_name = (item.get('name') or '').strip()
+                if not raw_name:
+                    raise ValueError("Medicine name is required")
+
+                stock = int(item.get('stock', 0) or 0)
+                if stock < 0:
+                    raise ValueError("Stock cannot be negative")
+
+                raw_price = item.get('price', 0)
+                try:
+                    price = Decimal(str(raw_price or 0)).quantize(Decimal('0.01'))
+                except (InvalidOperation, ValueError):
+                    raise ValueError("Price must be a valid number")
+
+                if price < 0:
+                    raise ValueError("Price cannot be negative")
+
+                dosage = (item.get('dosage') or '').strip()
+                generic_name = (item.get('generic_name') or '').strip()
+                unit = (item.get('unit') or '').strip()
+
+                medicine = Medicine.objects.filter(name__iexact=raw_name, dosage=dosage).first()
+                if medicine is None:
+                    medicine = Medicine.objects.create(
+                        name=raw_name,
+                        generic_name=generic_name,
+                        dosage=dosage,
+                        unit=unit,
+                    )
+
+                if stock <= 0:
+                    status_value = 'out_of_stock'
+                elif stock <= 20:
+                    status_value = 'low_stock'
+                else:
+                    status_value = 'in_stock'
+
+                pharmacy_medicine, created = PharmacyMedicine.objects.update_or_create(
+                    pharmacy=pharmacy,
+                    medicine=medicine,
+                    defaults={
+                        'stock': stock,
+                        'price': price,
+                        'status': status_value,
+                    },
+                )
+
+                success_count += 1
+                results.append({
+                    'row': index,
+                    'name': medicine.name,
+                    'id': pharmacy_medicine.id,
+                    'created': created,
+                })
+            except Exception as exc:
+                failed_count += 1
+                results.append({
+                    'row': index,
+                    'name': (item.get('name') or '').strip() if isinstance(item, dict) else '',
+                    'error': str(exc),
+                })
+
+    return Response(
+        {
+            'success_count': success_count,
+            'failed_count': failed_count,
+            'results': results,
+            'message': f"Processed {len(medicines)} medicines",
+        },
+        status=status.HTTP_200_OK,
+    )
+
 # Delivery Dashboard Views
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -638,13 +739,15 @@ def verify_razorpay_payment(request, order_id):
         
         razorpay_client.utility.verify_payment_signature(params_dict)
         
-        # Payment verified successfully - create payment record
-        payment = Payment.objects.create(
+        # Payment verified successfully - upsert payment record
+        Payment.objects.update_or_create(
             order=order,
-            amount=order.total_price,
-            payment_method='razorpay',
-            transaction_id=razorpay_payment_id,
-            status='paid'
+            defaults={
+                'amount': order.total_price,
+                'payment_method': 'razorpay',
+                'transaction_id': razorpay_payment_id,
+                'status': 'paid'
+            }
         )
 
         # Update order status
@@ -659,12 +762,14 @@ def verify_razorpay_payment(request, order_id):
     
     except razorpay.errors.SignatureVerificationError:
         # Payment verification failed
-        Payment.objects.create(
+        Payment.objects.update_or_create(
             order=order,
-            amount=order.total_price,
-            payment_method='razorpay',
-            transaction_id=razorpay_payment_id,
-            status='failed'
+            defaults={
+                'amount': order.total_price,
+                'payment_method': 'razorpay',
+                'transaction_id': razorpay_payment_id,
+                'status': 'failed'
+            }
         )
         
         order.payment_status = 'failed'
@@ -715,12 +820,14 @@ def verify_cart_razorpay_payment(request):
             if order.payment_status == 'paid':
                 continue
 
-            Payment.objects.create(
+            Payment.objects.update_or_create(
                 order=order,
-                amount=order.total_price,
-                payment_method='razorpay',
-                transaction_id=f"{razorpay_payment_id}:{order.order_id}",
-                status='paid'
+                defaults={
+                    'amount': order.total_price,
+                    'payment_method': 'razorpay',
+                    'transaction_id': razorpay_payment_id,
+                    'status': 'paid'
+                }
             )
             order.payment_status = 'paid'
             order.save()
@@ -735,12 +842,14 @@ def verify_cart_razorpay_payment(request):
     except razorpay.errors.SignatureVerificationError:
         for order in orders:
             if order.payment_status != 'paid':
-                Payment.objects.create(
+                Payment.objects.update_or_create(
                     order=order,
-                    amount=order.total_price,
-                    payment_method='razorpay',
-                    transaction_id=f"{razorpay_payment_id}:{order.order_id}",
-                    status='failed'
+                    defaults={
+                        'amount': order.total_price,
+                        'payment_method': 'razorpay',
+                        'transaction_id': razorpay_payment_id,
+                        'status': 'failed'
+                    }
                 )
                 order.payment_status = 'failed'
                 order.save()
@@ -807,6 +916,30 @@ def pharmacy_accept_order(request, order_id):
         
         if not orders.exists():
             return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Reconcile grouped cart payments: if any order in this group has a paid payment,
+        # synchronize all pending sibling orders in the same order group as paid.
+        paid_payment = Payment.objects.filter(
+            order__order_id=order_id,
+            status='paid'
+        ).order_by('-payment_date').first()
+
+        if paid_payment and orders.exclude(payment_status='paid').exists():
+            pending_order_ids = list(orders.exclude(payment_status='paid').values_list('id', flat=True))
+            if pending_order_ids:
+                Order.objects.filter(id__in=pending_order_ids).update(payment_status='paid')
+                for pending_order in Order.objects.filter(id__in=pending_order_ids):
+                    Payment.objects.update_or_create(
+                        order=pending_order,
+                        defaults={
+                            'amount': pending_order.total_price,
+                            'payment_method': 'razorpay',
+                            'transaction_id': paid_payment.transaction_id,
+                            'status': 'paid'
+                        }
+                    )
+
+            orders = Order.objects.filter(order_id=order_id, pharmacy=pharmacy)
 
         # Payment must be completed before pharmacy can act on order
         if orders.exclude(payment_status='paid').exists():
@@ -953,30 +1086,41 @@ def delivery_accept_order(request, order_id):
     if request.user.role != 'delivery':
         return Response({"error": "Only delivery partners can accept deliveries"}, status=status.HTTP_403_FORBIDDEN)
 
-    try:
-        order = Order.objects.get(order_id=order_id, delivery_partner=request.user)
-    except Order.DoesNotExist:
+    orders = Order.objects.filter(order_id=order_id, delivery_partner=request.user).order_by('created_at')
+    if not orders.exists():
         return Response({"error": "Order not found or not assigned to you"}, status=status.HTTP_404_NOT_FOUND)
+
+    order = orders.first()
 
     action = request.data.get('action')  # 'accept' or 'reject'
 
     if action == 'accept':
-        order.order_status = 'out_for_delivery'
-        order.save()
+        orders.update(order_status='out_for_delivery')
 
         # Update delivery status
-        delivery = order.delivery
+        delivery, _ = Delivery.objects.get_or_create(
+            order=order,
+            defaults={
+                'pickup_address': order.pharmacy.address if order.pharmacy else "",
+                'delivery_address': order.delivery_address,
+                'status': 'assigned',
+                'driver': request.user
+            }
+        )
         delivery.status = 'assigned'
         delivery.driver = request.user
         delivery.save()
 
-        return Response({"message": "Delivery accepted", "order": OrderSerializer(order).data})
+        return Response({
+            "message": "Delivery accepted",
+            "order": OrderSerializer(order).data,
+            "items_count": orders.count()
+        })
 
     elif action == 'reject':
         # Remove delivery partner assignment
-        order.delivery_partner = None
-        order.save()
-        return Response({"message": "Delivery rejected"})
+        orders.update(delivery_partner=None)
+        return Response({"message": "Delivery rejected", "items_count": orders.count()})
 
     return Response({"error": "Invalid action"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -988,19 +1132,30 @@ def mark_delivery_complete(request, order_id):
     if request.user.role != 'delivery':
         return Response({"error": "Only delivery partners can complete deliveries"}, status=status.HTTP_403_FORBIDDEN)
 
-    try:
-        order = Order.objects.get(order_id=order_id, delivery_partner=request.user)
-        delivery = order.delivery
-    except Order.DoesNotExist:
+    orders = Order.objects.filter(order_id=order_id, delivery_partner=request.user).order_by('created_at')
+    if not orders.exists():
         return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    order.order_status = 'delivered'
+    order = orders.first()
+
+    try:
+        delivery = order.delivery
+    except Delivery.DoesNotExist:
+        return Response({"error": "Delivery record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    orders.update(order_status='delivered')
     delivery.status = 'delivered'
-    delivery.actual_time = delivery.estimated_time  # Mock actual time
-    order.save()
+
+    elapsed_minutes = int((timezone.now() - delivery.created_at).total_seconds() / 60)
+    delivery.actual_time = max(elapsed_minutes, 1)
+
     delivery.save()
 
-    return Response({"message": "Delivery completed", "order": OrderSerializer(order).data})
+    return Response({
+        "message": "Delivery completed",
+        "order": OrderSerializer(order).data,
+        "items_count": orders.count()
+    })
 
 
 @api_view(['POST'])
@@ -1019,17 +1174,18 @@ def generate_delivery_otp(request, order_id):
             "error": f"Only delivery partners can generate OTP. Your role is: {request.user.role}"
         }, status=status.HTTP_403_FORBIDDEN)
 
-    try:
-        # First, try to get the order
-        order = Order.objects.get(order_id=order_id)
-        
-        # Verify that the order is assigned to the current user (or user is admin)
-        if order.delivery_partner != request.user and request.user.role != 'admin':
+    orders = Order.objects.filter(order_id=order_id).order_by('created_at')
+    if not orders.exists():
+        return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    order = orders.first()
+
+    # Verify that the order group is assigned to the current user (or user is admin)
+    if request.user.role != 'admin':
+        if orders.exclude(delivery_partner=request.user).exists():
             return Response({
                 "error": "This order is not assigned to you"
             }, status=status.HTTP_403_FORBIDDEN)
-    except Order.DoesNotExist:
-        return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
     
     try:
         delivery = order.delivery
@@ -1104,19 +1260,23 @@ def verify_delivery_otp(request, order_id):
     if not otp_entered:
         return Response({"error": "OTP is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        # First, try to get the order
-        order = Order.objects.get(order_id=order_id)
-        
-        # Verify that the order is assigned to the current user (or user is admin)
-        if order.delivery_partner != request.user and request.user.role != 'admin':
+    orders = Order.objects.filter(order_id=order_id).order_by('created_at')
+    if not orders.exists():
+        return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    order = orders.first()
+
+    # Verify that the order group is assigned to the current user (or user is admin)
+    if request.user.role != 'admin':
+        if orders.exclude(delivery_partner=request.user).exists():
             return Response({
                 "error": "This order is not assigned to you"
             }, status=status.HTTP_403_FORBIDDEN)
-        
+
+    try:
         delivery = order.delivery
-    except Order.DoesNotExist:
-        return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+    except Delivery.DoesNotExist:
+        return Response({"error": "Delivery record not found"}, status=status.HTTP_404_NOT_FOUND)
 
     # Check if OTP exists
     if not delivery.otp:
@@ -1134,15 +1294,15 @@ def verify_delivery_otp(request, order_id):
 
     # OTP is valid - mark delivery as completed
     delivery.status = 'delivered'
-    delivery.actual_time = delivery.estimated_time  # You can calculate actual time here
-    order.order_status = 'delivered'
+    elapsed_minutes = int((timezone.now() - delivery.created_at).total_seconds() / 60)
+    delivery.actual_time = max(elapsed_minutes, 1)
+    orders.update(order_status='delivered')
     
     # Clear OTP after successful verification
     delivery.otp = None
     delivery.otp_generated_at = None
     
     delivery.save()
-    order.save()
 
     # Notify customer that delivery is completed
     try:
@@ -1158,7 +1318,8 @@ def verify_delivery_otp(request, order_id):
 
     return Response({
         "message": "Delivery completed successfully",
-        "order": OrderSerializer(order).data
+        "order": OrderSerializer(order).data,
+        "items_count": orders.count()
     })
 
 
@@ -1266,9 +1427,44 @@ def delivery_orders(request):
     if request.user.role != 'delivery':
         return Response({"error": "Only delivery partners can view delivery orders"}, status=status.HTTP_403_FORBIDDEN)
 
-    orders = Order.objects.filter(delivery_partner=request.user).order_by('-created_at')
-    serializer = OrderSerializer(orders, many=True)
-    return Response(serializer.data)
+    orders = Order.objects.filter(delivery_partner=request.user).select_related('user', 'pharmacy', 'medicine').order_by('-created_at')
+
+    grouped_orders = {}
+    for order in orders:
+        if order.order_id not in grouped_orders:
+            grouped_orders[order.order_id] = {
+                'id': order.id,
+                'order_id': order.order_id,
+                'user': order.user.email if order.user else None,
+                'user_name': order.user.full_name if order.user else None,
+                'pharmacy': order.pharmacy.id if order.pharmacy else None,
+                'pharmacy_name': order.pharmacy.name if order.pharmacy else None,
+                'delivery_partner': order.delivery_partner.id if order.delivery_partner else None,
+                'delivery_partner_name': order.delivery_partner.full_name if order.delivery_partner else None,
+                'delivery_address': order.delivery_address,
+                'payment_status': order.payment_status,
+                'order_status': order.order_status,
+                'created_at': order.created_at.isoformat(),
+                'updated_at': order.updated_at.isoformat(),
+                'total_price': 0,
+                'total_items': 0,
+                'medicines': []
+            }
+
+        grouped_orders[order.order_id]['medicines'].append({
+            'id': order.id,
+            'medicine_id': order.medicine.id if order.medicine else None,
+            'medicine_name': order.medicine.name if order.medicine else 'Unknown',
+            'medicine_dosage': order.medicine.dosage if order.medicine else '',
+            'quantity': order.quantity,
+            'price': float(order.total_price)
+        })
+        grouped_orders[order.order_id]['total_price'] += float(order.total_price)
+        grouped_orders[order.order_id]['total_items'] += int(order.quantity)
+
+    result = list(grouped_orders.values())
+    result.sort(key=lambda x: x['created_at'], reverse=True)
+    return Response(result)
 
 
 @api_view(['GET'])
@@ -1397,8 +1593,22 @@ def delivery_dashboard(request):
         status__in=['pending', 'assigned']
     ).count()
 
-    # Calculate average delivery time (placeholder)
-    avg_delivery_time = "25 min"
+    completed_deliveries = Delivery.objects.filter(
+        driver=request.user,
+        status='delivered'
+    )
+
+    avg_time_value = completed_deliveries.aggregate(avg_time=Avg('actual_time'))['avg_time']
+
+    if avg_time_value is None:
+        completed_with_duration = []
+        for completed_delivery in completed_deliveries:
+            if completed_delivery.updated_at and completed_delivery.created_at:
+                minutes = int((completed_delivery.updated_at - completed_delivery.created_at).total_seconds() / 60)
+                completed_with_duration.append(max(minutes, 1))
+        avg_time_value = (sum(completed_with_duration) / len(completed_with_duration)) if completed_with_duration else 0
+
+    avg_delivery_time = f"{int(round(avg_time_value))} min"
 
     return Response({
         'stats': {
@@ -1430,18 +1640,36 @@ def assign_delivery_partner(request, order_id):
 
     delivery_partner_id = request.data.get('delivery_partner_id')
 
-    try:
-        order = Order.objects.get(order_id=order_id)
-        delivery_partner = User.objects.get(id=delivery_partner_id, role='delivery')
-    except Order.DoesNotExist:
+    orders = Order.objects.filter(order_id=order_id).order_by('created_at')
+    if not orders.exists():
         return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    try:
+        delivery_partner = User.objects.get(id=delivery_partner_id, role='delivery')
     except User.DoesNotExist:
         return Response({"error": "Delivery partner not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    order.delivery_partner = delivery_partner
-    order.save()
+    orders.update(delivery_partner=delivery_partner)
 
-    return Response({"message": "Delivery partner assigned", "order": OrderSerializer(order).data})
+    primary_order = orders.first()
+    delivery, _ = Delivery.objects.get_or_create(
+        order=primary_order,
+        defaults={
+            'pickup_address': primary_order.pharmacy.address if primary_order.pharmacy else "",
+            'delivery_address': primary_order.delivery_address,
+            'status': 'assigned',
+            'driver': delivery_partner
+        }
+    )
+    delivery.status = 'assigned'
+    delivery.driver = delivery_partner
+    delivery.save()
+
+    return Response({
+        "message": "Delivery partner assigned",
+        "order": OrderSerializer(primary_order).data,
+        "items_count": orders.count()
+    })
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1456,7 +1684,7 @@ def get_pending_delivery_orders(request):
                 "user_role": user_role
             }, status=status.HTTP_403_FORBIDDEN)
 
-        # Get all pending delivery orders (not yet assigned to any delivery partner)
+        # Get all pending delivery order rows
         pending_orders = Order.objects.filter(
             delivery_required=True,
             payment_status='paid',
@@ -1464,8 +1692,43 @@ def get_pending_delivery_orders(request):
             delivery_partner__isnull=True
         ).select_related('pharmacy', 'medicine', 'user').order_by('-created_at')
 
-        serializer = OrderSerializer(pending_orders, many=True)
-        return Response(serializer.data)
+        # Group rows by order_id so a cart checkout appears as one delivery job
+        grouped_orders = {}
+        for order in pending_orders:
+            if order.order_id not in grouped_orders:
+                grouped_orders[order.order_id] = {
+                    'id': order.id,
+                    'order_id': order.order_id,
+                    'user': order.user.email if order.user else None,
+                    'user_name': order.user.full_name if order.user else None,
+                    'pharmacy': order.pharmacy.id if order.pharmacy else None,
+                    'pharmacy_name': order.pharmacy.name if order.pharmacy else None,
+                    'delivery_address': order.delivery_address,
+                    'order_status': order.order_status,
+                    'payment_status': order.payment_status,
+                    'delivery_required': order.delivery_required,
+                    'created_at': order.created_at.isoformat(),
+                    'updated_at': order.updated_at.isoformat(),
+                    'total_price': 0,
+                    'total_items': 0,
+                    'medicines': []
+                }
+
+            grouped_orders[order.order_id]['medicines'].append({
+                'id': order.id,
+                'medicine_id': order.medicine.id if order.medicine else None,
+                'medicine_name': order.medicine.name if order.medicine else 'Unknown',
+                'medicine_dosage': order.medicine.dosage if order.medicine else '',
+                'quantity': order.quantity,
+                'price': float(order.total_price)
+            })
+            grouped_orders[order.order_id]['total_price'] += float(order.total_price)
+            grouped_orders[order.order_id]['total_items'] += int(order.quantity)
+
+        result = list(grouped_orders.values())
+        result.sort(key=lambda x: x['created_at'], reverse=True)
+
+        return Response(result)
     except Exception as e:
         import traceback
         return Response({
@@ -1618,45 +1881,109 @@ def accept_delivery_order(request, order_id):
                 "user_role": user_role
             }, status=status.HTTP_403_FORBIDDEN)
 
-        try:
-            order = Order.objects.get(order_id=order_id, delivery_required=True)
-        except Order.DoesNotExist:
+        grouped_orders = Order.objects.filter(
+            order_id=order_id,
+            delivery_required=True
+        ).select_related('pharmacy').order_by('created_at')
+
+        if not grouped_orders.exists():
             return Response({"error": "Order not found or delivery not required"}, status=status.HTTP_404_NOT_FOUND)
 
-        # Check if order is already assigned
-        if order.delivery_partner is not None:
+        # Reject only when already claimed by a different delivery partner
+        assigned_to_other = grouped_orders.exclude(
+            delivery_partner__isnull=True
+        ).exclude(
+            delivery_partner=request.user
+        )
+        if assigned_to_other.exists():
             return Response({"error": "Order already assigned to another delivery partner"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Assign delivery partner
-        order.delivery_partner = request.user
-        order.order_status = 'out_for_delivery'
-        order.save()
+        # Update all grouped order rows so grouped carts stay consistent
+        grouped_orders.update(
+            delivery_partner=request.user,
+            order_status='out_for_delivery'
+        )
 
-        # Update delivery status if it exists
-        try:
-            delivery = Delivery.objects.get(order=order)
-            delivery.status = 'assigned'
-            delivery.driver = request.user
-            delivery.save()
-        except Delivery.DoesNotExist:
-            # Create delivery record if it doesn't exist
-            delivery = Delivery.objects.create(
-                order=order,
-                pickup_address=order.pharmacy.address if order.pharmacy else "",
-                delivery_address=order.delivery_address,
-                status='assigned',
-                driver=request.user
-            )
+        # Use earliest order row as primary delivery record anchor
+        primary_order = grouped_orders.first()
 
-        # Mark all notifications for this order as read for this user
+        delivery, _ = Delivery.objects.get_or_create(
+            order=primary_order,
+            defaults={
+                'pickup_address': primary_order.pharmacy.address if primary_order.pharmacy else "",
+                'delivery_address': primary_order.delivery_address,
+                'status': 'assigned',
+                'driver': request.user
+            }
+        )
+        delivery.status = 'assigned'
+        delivery.driver = request.user
+        delivery.save()
+
+        # Mark all notifications for this grouped order as read for this user
         Notification.objects.filter(
             delivery_partner=request.user,
-            order=order
+            order__order_id=order_id
         ).update(is_read=True)
 
         return Response({
             "message": "Delivery order accepted successfully",
-            "order": OrderSerializer(order).data
+            "order": OrderSerializer(primary_order).data,
+            "items_count": grouped_orders.count()
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        import traceback
+        return Response({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def delivery_reject_order(request, order_id):
+    """Reject a delivery order and release it for other delivery partners"""
+    try:
+        user_role = getattr(request.user, 'role', None)
+        if user_role != 'delivery':
+            return Response({
+                "error": "Only delivery partners can reject orders",
+                "user_role": user_role
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        grouped_orders = Order.objects.filter(
+            order_id=order_id,
+            delivery_required=True,
+            delivery_partner=request.user
+        ).order_by('created_at')
+
+        if not grouped_orders.exists():
+            return Response({"error": "Order not found or not assigned to you"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Put group back into pending delivery pool for other partners
+        grouped_orders.update(
+            delivery_partner=None,
+            order_status='pharmacy_accepted'
+        )
+
+        primary_order = grouped_orders.first()
+        try:
+            delivery = primary_order.delivery
+            delivery.status = 'pending'
+            delivery.driver = None
+            delivery.otp = None
+            delivery.otp_generated_at = None
+            delivery.save()
+        except Delivery.DoesNotExist:
+            pass
+
+        reason = request.data.get('reason')
+
+        return Response({
+            "message": "Delivery rejected. Order is available for other delivery partners.",
+            "order_id": order_id,
+            "items_count": grouped_orders.count(),
+            "reason": reason
         }, status=status.HTTP_200_OK)
     except Exception as e:
         import traceback
@@ -1923,86 +2250,139 @@ def checkout_cart(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def request_refund(request, order_id):
-    """User requests a refund for an order (typically due to pharmacy rejection)"""
+    """User requests a refund for an order/grouped order_id"""
     try:
-        order = Order.objects.get(order_id=order_id, user=request.user)
-    except Order.DoesNotExist:
-        return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
+        orders = Order.objects.filter(order_id=order_id, user=request.user)
+        if not orders.exists():
+            return Response({"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    try:
-        payment = order.payment
-    except Payment.DoesNotExist:
-        return Response({"error": "No payment record found for this order"}, status=status.HTTP_404_NOT_FOUND)
+        refundable_states = ['pharmacy_rejected', 'cancelled', 'delivery_failed']
+        invalid_orders = orders.exclude(order_status__in=refundable_states)
+        if invalid_orders.exists():
+            return Response({
+                "error": "Order cannot be refunded in current status",
+                "details": [
+                    {
+                        "order_db_id": order.id,
+                        "status": order.order_status,
+                    }
+                    for order in invalid_orders
+                ]
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-    # Check if order is in a refundable state
-    if order.order_status not in ['pharmacy_rejected', 'cancelled', 'delivery_failed']:
-        return Response({
-            "error": "Order cannot be refunded in current status",
-            "current_status": order.order_status
-        }, status=status.HTTP_400_BAD_REQUEST)
+        payments = []
+        missing_payments = []
+        unpaid_orders = []
+        already_refunded = []
 
-    # Check if payment was actually made
-    if payment.status != 'paid':
-        return Response({
-            "error": "Only paid orders can be refunded"
-        }, status=status.HTTP_400_BAD_REQUEST)
+        for order in orders:
+            try:
+                payment = order.payment
+            except Payment.DoesNotExist:
+                missing_payments.append(order.id)
+                continue
 
-    # Check if already refunded
-    if payment.refund_status != 'no_refund':
-        return Response({
-            "error": f"Refund already {payment.refund_status}",
-            "refund_status": payment.refund_status
-        }, status=status.HTTP_400_BAD_REQUEST)
+            if payment.status != 'paid':
+                unpaid_orders.append(order.id)
+                continue
 
-    refund_reason = request.data.get('reason', 'Order cancelled by user')
+            if payment.refund_status != 'no_refund':
+                already_refunded.append({
+                    "order_db_id": order.id,
+                    "refund_status": payment.refund_status,
+                })
+                continue
 
-    try:
-        # Update payment refund status
-        payment.refund_status = 'initiated'
-        payment.refund_amount = payment.amount
-        payment.refund_reason = refund_reason
-        payment.refund_initiated_at = timezone.now()
-        payment.save()
+            payments.append(payment)
 
-        # Call Razorpay refund API if payment was via Razorpay
-        if payment.payment_method == 'razorpay' and payment.transaction_id:
+        if missing_payments:
+            return Response({
+                "error": "No payment record found for some order items",
+                "missing_order_ids": missing_payments,
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        if unpaid_orders:
+            return Response({
+                "error": "Only paid orders can be refunded",
+                "unpaid_order_ids": unpaid_orders,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if already_refunded:
+            return Response({
+                "error": "Refund already requested for some items",
+                "details": already_refunded,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not payments:
+            return Response({
+                "error": "No refundable payment records found"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        refund_reason = request.data.get('reason', 'Order cancelled by user')
+        now = timezone.now()
+
+        for payment in payments:
+            payment.refund_status = 'initiated'
+            payment.refund_amount = payment.amount
+            payment.refund_reason = refund_reason
+            payment.refund_initiated_at = now
+            payment.save()
+
+        transaction_groups = {}
+        for payment in payments:
+            if payment.payment_method == 'razorpay' and payment.transaction_id:
+                key = payment.transaction_id
+                if key not in transaction_groups:
+                    transaction_groups[key] = []
+                transaction_groups[key].append(payment)
+
+        for transaction_id, grouped_payments in transaction_groups.items():
+            total_amount = sum(float(p.amount) for p in grouped_payments)
             try:
                 refund_response = razorpay_client.payment.refund(
-                    payment.transaction_id,
+                    transaction_id,
                     {
-                        'amount': int(float(payment.amount) * 100),  # Convert to paise
+                        'amount': int(total_amount * 100),
                         'notes': {
                             'order_id': order_id,
-                            'reason': refund_reason
+                            'reason': refund_reason,
                         }
                     }
                 )
-                payment.refund_transaction_id = refund_response['id']
-                payment.refund_status = 'processing'
-                payment.save()
+                for grouped_payment in grouped_payments:
+                    grouped_payment.refund_transaction_id = refund_response['id']
+                    grouped_payment.refund_status = 'processing'
+                    grouped_payment.save()
             except Exception as razorpay_error:
                 print(f"Razorpay refund error: {str(razorpay_error)}")
-                # Mark as pending manual processing if API fails
-                payment.refund_status = 'pending'
-                payment.save()
+                for grouped_payment in grouped_payments:
+                    grouped_payment.refund_status = 'pending'
+                    grouped_payment.save()
 
-        # Create notification for user
-        try:
-            UserNotification.objects.create(
-                user=request.user,
-                order=order,
-                notification_type='order_status',
-                title='Refund Initiated',
-                message=f'Your refund for order {order_id} has been initiated. Amount: ₹{payment.amount}. Check back for status updates.'
-            )
-        except Exception as notif_error:
-            print(f"Notification creation error: {str(notif_error)}")
+        for order in orders:
+            try:
+                UserNotification.objects.create(
+                    user=request.user,
+                    order=order,
+                    notification_type='order_status',
+                    title='Refund Initiated',
+                    message=f'Your refund for order {order_id} has been initiated. Check back for status updates.'
+                )
+            except Exception as notif_error:
+                print(f"Notification creation error: {str(notif_error)}")
+
+        refreshed_payments = Payment.objects.filter(order__in=orders)
+        final_status = 'processing' if refreshed_payments.filter(refund_status='processing').exists() else (
+            'pending' if refreshed_payments.filter(refund_status='pending').exists() else 'initiated'
+        )
+        total_refund = sum(float(p.amount) for p in refreshed_payments)
 
         return Response({
             "message": "Refund request processed successfully",
-            "refund_status": payment.refund_status,
-            "refund_amount": str(payment.amount),
-            "refund_initiated_at": payment.refund_initiated_at.isoformat()
+            "refund_status": final_status,
+            "refund_amount": f"{total_refund:.2f}",
+            "refund_initiated_at": now.isoformat(),
+            "items_count": orders.count(),
         }, status=status.HTTP_200_OK)
 
     except Exception as e:

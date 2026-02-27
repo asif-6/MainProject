@@ -194,12 +194,15 @@ function PharmacyDashboard() {
     }
 
     try {
-      // Parse CSV format: Name,Stock,Price (one per line)
       const lines = bulkMedicinesText.trim().split('\n').filter(line => line.trim());
-      const medicines = lines.map(line => {
+      const medicines = lines.map((line, index) => {
         const [name, stock, price] = line.split(',').map(s => s.trim());
-        if (!name) throw new Error("Medicine name is required");
-        return { name, stock: Number(stock) || 0, price: Number(price) || 0 };
+        if (!name) throw new Error(`Line ${index + 1}: Medicine name is required`);
+        return {
+          name,
+          stock: Number(stock) || 0,
+          price: Number(price) || 0,
+        };
       });
 
       if (medicines.length === 0) {
@@ -207,59 +210,30 @@ function PharmacyDashboard() {
         return;
       }
 
-      let successCount = 0;
-      let failedCount = 0;
+      const res = await fetch(`${API_BASE_URL}/pharmacy-medicines/bulk-add/`, {
+        method: "POST",
+        headers: getHeaders(),
+        body: JSON.stringify({ medicines }),
+      });
 
-      for (const med of medicines) {
-        try {
-          // Get or create medicine
-          const medPayload = {
-            name: med.name,
-            generic_name: "",
-            dosage: "",
-            unit: "",
-          };
-
-          let medData = null;
-          const medRes = await fetch(`${API_BASE_URL}/medicines/`, {
-            method: "POST",
-            headers: getHeaders(),
-            body: JSON.stringify(medPayload),
-          });
-
-          if (medRes.ok) {
-            medData = await medRes.json();
-          } else {
-            const listRes = await fetch(`${API_BASE_URL}/medicines/`, { headers: getHeaders() });
-            const list = await listRes.json();
-            medData = list.find(m => m.name && m.name.toLowerCase() === med.name.toLowerCase());
-            if (!medData) throw new Error("Medicine not found or created");
-          }
-
-          // Add to pharmacy inventory
-          const pmPayload = {
-            medicine_id: medData.id,
-            stock: med.stock,
-            price: med.price,
-          };
-
-          const pmRes = await fetch(`${API_BASE_URL}/pharmacy-medicines/`, {
-            method: "POST",
-            headers: getHeaders(),
-            body: JSON.stringify(pmPayload),
-          });
-
-          if (pmRes.ok) {
-            successCount++;
-          } else {
-            failedCount++;
-          }
-        } catch (err) {
-          failedCount++;
-        }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || data.message || 'Failed to bulk add medicines');
       }
 
-      showNotification(`Added ${successCount} medicines${failedCount > 0 ? ` (${failedCount} failed)` : ''}`, 'success');
+      const successCount = data.success_count || 0;
+      const failedCount = data.failed_count || 0;
+
+      if (failedCount > 0) {
+        const firstError = (data.results || []).find(r => r.error);
+        showNotification(
+          `Processed ${successCount} medicines (${failedCount} failed)${firstError ? `: ${firstError.error}` : ''}`,
+          successCount > 0 ? 'success' : 'error'
+        );
+      } else {
+        showNotification(`Successfully added ${successCount} medicines`, 'success');
+      }
+
       setBulkMedicinesText("");
       setBulkAddOpen(false);
       loadDashboardData();

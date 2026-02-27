@@ -62,6 +62,7 @@ export default function DeliveryDashboard() {
 
     // Auto-refresh every 30 seconds to check for new orders
     const interval = setInterval(() => {
+      loadDashboardData();
       loadPendingOrders();
       loadNotifications();
     }, 30000);
@@ -214,7 +215,9 @@ export default function DeliveryDashboard() {
         const reason = prompt("Reason for rejection (optional):");
         await deliveryRejectOrder(orderId, reason || "No reason provided");
         showNotification('Delivery rejected successfully', 'success');
+        loadDashboardData();
         loadPendingOrders();
+        loadNotifications();
       } else if (action === 'complete') {
         await markDeliveryComplete(orderId);
         showNotification('Delivery completed successfully', 'success');
@@ -358,7 +361,6 @@ export default function DeliveryDashboard() {
           <p>Track and manage all deliveries in real-time</p>
         </div>
         <div style={{ display: "flex", gap: "12px" }}>
-          <button className="btn-primary">+ Create Delivery</button>
           <button
             onClick={handleRefresh}
             style={{
@@ -617,14 +619,28 @@ export default function DeliveryDashboard() {
 
                     <div style={{ marginBottom: '16px' }}>
                       <p style={{ margin: '6px 0', fontSize: '0.95rem', color: '#333' }}>
-                        <strong>Medicine:</strong> {order.medicine_name}
-                      </p>
-                      <p style={{ margin: '6px 0', fontSize: '0.95rem', color: '#333' }}>
-                        <strong>Quantity:</strong> {order.quantity}
+                        <strong>Items:</strong> {order.total_items || order.quantity || 1}
                       </p>
                       <p style={{ margin: '6px 0', fontSize: '0.95rem', color: '#333' }}>
                         <strong>Total:</strong> ₹{order.total_price}
                       </p>
+
+                      {Array.isArray(order.medicines) && order.medicines.length > 0 ? (
+                        <div style={{ marginTop: '8px', padding: '10px', background: '#f8fafc', borderRadius: '8px' }}>
+                          <p style={{ margin: '0 0 6px 0', fontSize: '0.9rem', fontWeight: '600', color: '#334155' }}>
+                            Medicines in this delivery:
+                          </p>
+                          {order.medicines.map((item) => (
+                            <p key={item.id} style={{ margin: '4px 0', fontSize: '0.88rem', color: '#475569' }}>
+                              • {item.medicine_name} × {item.quantity}
+                            </p>
+                          ))}
+                        </div>
+                      ) : (
+                        <p style={{ margin: '6px 0', fontSize: '0.95rem', color: '#333' }}>
+                          <strong>Medicine:</strong> {order.medicine_name}
+                        </p>
+                      )}
                     </div>
 
                     <div className="delivery-route">
