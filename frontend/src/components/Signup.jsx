@@ -6,6 +6,7 @@ export default function Signup() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
 
   const [formData, setFormData] = useState({
     name: "",
@@ -22,6 +23,7 @@ export default function Signup() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
+    setSuccess("");
     setLoading(true);
 
     if (formData.password !== formData.confirmPassword) {
@@ -49,8 +51,8 @@ export default function Signup() {
       if (response.ok) {
         localStorage.setItem("token", data.token);
         localStorage.setItem("role", data.role);
-        alert("Account created successfully");
-        navigate("/login");
+        setSuccess("Account created successfully. Redirecting to login...");
+        setTimeout(() => navigate("/login"), 900);
       } else {
         setError(data.message || "Signup failed. Please try again.");
       }
@@ -64,12 +66,15 @@ export default function Signup() {
 
   return (
     <div className="auth-container">
+      {(error || success) && (
+        <div className={`auth-notice ${success ? "auth-notice--success" : "auth-notice--error"}`}>
+          {success || error}
+        </div>
+      )}
       <div className="auth-card auth-card--signup">
         <div className="auth-badge">Start free</div>
         <h2 className="auth-title">Create Account</h2>
         <p className="auth-subtitle">Register and access medicine availability quickly.</p>
-
-        {error && <p style={{ color: "#ef4444", marginBottom: "15px" }}>{error}</p>}
 
         <form onSubmit={handleSubmit} className="auth-form">
           <label>Full Name</label>
